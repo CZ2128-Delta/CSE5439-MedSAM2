@@ -2,14 +2,14 @@
 
 scratch:
   resolution: 512
-  train_video_batch_size: 2 # increase batch size based on your computing
-  num_train_workers: 15
+  train_video_batch_size: 8 # increase batch size based on your computing
+  num_train_workers: 8
   num_frames: 8
   max_num_objects: 3
   base_lr: 5.0e-5
   vision_lr: 3.0e-05
   phases_per_epoch: 1
-  num_epochs: 75
+  num_epochs: 5
 
 dataset:
   # PATHS to Dataset
@@ -218,7 +218,7 @@ trainer:
               training: true
               video_dataset:
                 _target_: training.dataset.vos_raw_dataset.NPZRawDataset
-                folder: /home/jma/Documents/MedSAM2/data/RECIST_train_npz # must be absolute path
+                folder: /fs/scratch/PAS3272/liu12122/MedImgSeg/FLARE-Task1-PancancerRECIST-to-3D/train_npz # must be absolute path
               sampler:
                 _target_: training.dataset.vos_sampler.RandomUniformSampler
                 num_frames: ${scratch.num_frames}
@@ -306,6 +306,11 @@ trainer:
       should_log: True
     log_dir: ${launcher.experiment_log_dir}/logs
     log_freq: 10
+    # Weights & Biases (optional). Enable by passing --wandb-project from the launch script or setting non-null here.
+    wandb_project: null
+    wandb_name: null
+    wandb_entity: null
+    wandb_dir: null  # defaults to ${log_dir}/wandb if null
 
   # initialize from a SAM 2 checkpoint
   checkpoint:

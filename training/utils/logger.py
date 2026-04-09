@@ -8,6 +8,8 @@
 import atexit
 import functools
 import logging
+import math
+import os
 import sys
 import uuid
 from typing import Any, Dict, Optional, Union
@@ -149,9 +151,109 @@ class TensorBoardLogger(TensorBoardWriterWrapper):
         self._writer.add_hparams(hparams, meters)
 
 
+class WandBLogger:
+    """
+    Weights & Biases logger (rank 0 only). Mirrors TensorBoard scalar logging.
+    """
+
+    def __init__(
+        self,
+        project: str,
+        name: Optional[str] = None,
+        entity: Optional[str] = None,
+        dir: Optional[str] = None,
+    ) -> None:
+        self._wandb = None
+        self._active = False
+        try:
+            import wandb as wandb_module
+        except ImportError:
+            logging.warning(
+                "wandb is not installed; install with `pip install wandb` to enable W&B logging."
+            )
+            return
+
+        _, rank = get_machine_local_and_dist_rank()
+        if rank != 0:
+            return
+
+        self._wandb = wandb_module
+        if dir:
+            makedir(dir)
+        self._wandb.init(
+            project=project,
+            name=name,
+            entity=entity,
+            dir=dir,
+            reinit=True,
+        )
+        self._active = True
+        run_label = name if name is not None else getattr(self._wandb.run, "name", None)
+        logging.info("W&B initialized: project=%s name=%s", project, run_label)
+        atexit.register(self.finish)
+
+    def finish(self) -> None:
+        if not self._active or self._wandb is None:
+            return
+        try:
+            self._wandb.finish()
+        except Exception as e:
+            logging.warning("wandb.finish() failed: %s", e)
+        self._active = False
+
+    @staticmethod
+    def _to_float(data: Scalar) -> float:
+        if isinstance(data, Tensor):
+            return float(data.detach().cpu().item())
+        if isinstance(data, ndarray):
+            return float(data.item() if data.ndim == 0 else data.ravel()[0])
+        return float(data)
+
+    def log(self, name: str, data: Scalar, step: int) -> None:
+        if not self._active or self._wandb is None:
+            return
+        try:
+            v = self._to_float(data)
+            if not math.isfinite(v):
+                return
+            self._wandb.log({name: v}, step=int(step))
+        except Exception as e:
+            logging.debug("wandb.log skipped for %s: %s", name, e)
+
+    def log_dict(self, payload: Dict[str, Scalar], step: int) -> None:
+        if not self._active or self._wandb is None:
+            return
+        out: Dict[str, float] = {}
+        for k, v in payload.items():
+            try:
+                fv = self._to_float(v)
+                if math.isfinite(fv):
+                    out[k] = fv
+            except Exception:
+                continue
+        if out:
+            try:
+                self._wandb.log(out, step=int(step))
+            except Exception as e:
+                logging.debug("wandb.log_dict failed at step %s: %s", step, e)
+
+    def log_hparams(
+        self, hparams: Dict[str, Scalar], meters: Dict[str, Scalar]
+    ) -> None:
+        if not self._active or self._wandb is None:
+            return
+        try:
+            flat = {
+                f"hparam/{k}": self._to_float(v) for k, v in {**hparams, **meters}.items()
+            }
+            self._wandb.log(flat)
+        except Exception as e:
+            logging.debug("wandb hparams log failed: %s", e)
+
+
 class Logger:
     """
-    A logger class that can interface with multiple loggers. It now supports tensorboard only for simplicity, but you can extend it with your own logger.
+    Bridges TensorBoard and optional Weights & Biases (when ``wandb_project`` is set on ``LoggingConf``).
     """
 
     def __init__(self, logging_conf):
@@ -160,19 +262,38 @@ class Logger:
         tb_should_log = tb_config and tb_config.pop("should_log", True)
         self.tb_logger = instantiate(tb_config) if tb_should_log else None
 
+        wp = getattr(logging_conf, "wandb_project", None)
+        self.wandb_logger: Optional[WandBLogger] = None
+        if wp:
+            wandb_dir = getattr(logging_conf, "wandb_dir", None) or os.path.join(
+                logging_conf.log_dir, "wandb"
+            )
+            self.wandb_logger = WandBLogger(
+                project=wp,
+                name=getattr(logging_conf, "wandb_name", None),
+                entity=getattr(logging_conf, "wandb_entity", None),
+                dir=wandb_dir,
+            )
+
     def log_dict(self, payload: Dict[str, Scalar], step: int) -> None:
         if self.tb_logger:
             self.tb_logger.log_dict(payload, step)
+        if self.wandb_logger:
+            self.wandb_logger.log_dict(payload, step)
 
     def log(self, name: str, data: Scalar, step: int) -> None:
         if self.tb_logger:
             self.tb_logger.log(name, data, step)
+        if self.wandb_logger:
+            self.wandb_logger.log(name, data, step)
 
     def log_hparams(
         self, hparams: Dict[str, Scalar], meters: Dict[str, Scalar]
     ) -> None:
         if self.tb_logger:
             self.tb_logger.log_hparams(hparams, meters)
+        if self.wandb_logger:
+            self.wandb_logger.log_hparams(hparams, meters)
 
 
 # cache the opened file object, so that different calls to `setup_logger`

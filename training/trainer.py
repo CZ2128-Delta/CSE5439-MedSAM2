@@ -136,6 +136,11 @@ class LoggingConf:
     log_visual_frequency: int = 100
     scalar_keys_to_log: Optional[Dict[str, Any]] = None
     log_batch_stats: bool = False
+    # Weights & Biases (optional). When wandb_project is set, scalars mirror TensorBoard.
+    wandb_project: Optional[str] = None
+    wandb_name: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    wandb_dir: Optional[str] = None  # defaults to ${log_dir}/wandb
 
 
 class Trainer:
