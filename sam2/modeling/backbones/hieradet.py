@@ -197,6 +197,7 @@ class Hiera(nn.Module):
         ),
         weights_path=None,
         return_interm_layers=True,  # return feats from every stage
+        grad_ckpt: bool = False,
     ):
         super().__init__()
 
@@ -265,6 +266,8 @@ class Hiera(nn.Module):
             else [self.blocks[-1].dim_out]
         )
 
+        self.grad_ckpt = grad_ckpt
+
         if weights_path is not None:
             with g_pathmgr.open(weights_path, "rb") as f:
                 chkpt = torch.load(f, map_location="cpu")
@@ -289,7 +292,12 @@ class Hiera(nn.Module):
 
         outputs = []
         for i, blk in enumerate(self.blocks):
-            x = blk(x)
+            if self.grad_ckpt and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    blk, x, use_reentrant=False
+                )
+            else:
+                x = blk(x)
             if (i == self.stage_ends[-1]) or (
                 i in self.stage_ends and self.return_interm_layers
             ):

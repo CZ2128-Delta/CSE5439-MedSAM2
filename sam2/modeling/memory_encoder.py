@@ -118,10 +118,11 @@ class CXBlock(nn.Module):
 
 
 class Fuser(nn.Module):
-    def __init__(self, layer, num_layers, dim=None, input_projection=False):
+    def __init__(self, layer, num_layers, dim=None, input_projection=False, grad_ckpt=False):
         super().__init__()
         self.proj = nn.Identity()
         self.layers = get_clones(layer, num_layers)
+        self.grad_ckpt = grad_ckpt
 
         if input_projection:
             assert dim is not None
@@ -131,7 +132,12 @@ class Fuser(nn.Module):
         # normally x: (N, C, H, W)
         x = self.proj(x)
         for layer in self.layers:
-            x = layer(x)
+            if self.grad_ckpt and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, use_reentrant=False
+                )
+            else:
+                x = layer(x)
         return x
 
 

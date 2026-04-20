@@ -66,11 +66,17 @@ class SAM2Train(SAM2Base):
         # of all frames at once. This avoids backbone OOM errors on very long videos in evaluation, but could be slightly slower.
         forward_backbone_per_frame_for_eval=False,
         freeze_image_encoder=False,
+        grad_ckpt=False,
+        backbone_chunk_size=0,
         **kwargs,
     ):
         super().__init__(image_encoder, memory_attention, memory_encoder, **kwargs)
         self.use_act_ckpt_iterative_pt_sampling = use_act_ckpt_iterative_pt_sampling
         self.forward_backbone_per_frame_for_eval = forward_backbone_per_frame_for_eval
+        self.grad_ckpt = grad_ckpt
+        self.backbone_chunk_size = backbone_chunk_size
+        if grad_ckpt:
+            self._enable_grad_ckpt()
 
         # Point sampler and conditioning frames
         self.prob_to_use_pt_input_for_train = prob_to_use_pt_input_for_train
@@ -104,10 +110,58 @@ class SAM2Train(SAM2Base):
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
 
+    def _enable_grad_ckpt(self):
+        """Propagate grad_ckpt=True to all sub-modules that support it."""
+        trunk = self.image_encoder.trunk
+        if hasattr(trunk, "grad_ckpt"):
+            trunk.grad_ckpt = True
+            logging.info("Gradient checkpointing enabled for image_encoder.trunk (Hiera)")
+
+        if hasattr(self.memory_attention, "grad_ckpt"):
+            self.memory_attention.grad_ckpt = True
+            logging.info("Gradient checkpointing enabled for memory_attention")
+
+        mem_fuser = getattr(self.memory_encoder, "fuser", None)
+        if mem_fuser is not None and hasattr(mem_fuser, "grad_ckpt"):
+            mem_fuser.grad_ckpt = True
+            logging.info("Gradient checkpointing enabled for memory_encoder.fuser")
+
+    def _forward_image_chunked(self, img_batch: torch.Tensor) -> dict:
+        """Run ``forward_image`` in chunks of ``self.backbone_chunk_size`` frames.
+
+        This trades a small amount of wall-clock time (multiple smaller forward
+        passes instead of one large one) for a significant reduction in peak GPU
+        memory, because only ``backbone_chunk_size`` images need to be resident
+        in the backbone at any moment.
+        """
+        N = img_batch.shape[0]
+        cs = self.backbone_chunk_size
+        if cs <= 0 or cs >= N:
+            return self.forward_image(img_batch)
+
+        all_fpn: list = []
+        all_pos: list = []
+        for start in range(0, N, cs):
+            chunk = img_batch[start : start + cs]
+            out = self.forward_image(chunk)
+            all_fpn.append(out["backbone_fpn"])
+            all_pos.append(out["vision_pos_enc"])
+
+        num_levels = len(all_fpn[0])
+        merged_fpn = [torch.cat([fpn[i] for fpn in all_fpn], dim=0) for i in range(num_levels)]
+        merged_pos = [torch.cat([pos[i] for pos in all_pos], dim=0) for i in range(num_levels)]
+        return {
+            "vision_features": merged_fpn[-1],
+            "vision_pos_enc": merged_pos,
+            "backbone_fpn": merged_fpn,
+        }
+
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
-            # precompute image features on all frames before tracking
-            backbone_out = self.forward_image(input.flat_img_batch)
+            if self.training and self.backbone_chunk_size > 0:
+                backbone_out = self._forward_image_chunked(input.flat_img_batch)
+            else:
+                backbone_out = self.forward_image(input.flat_img_batch)
         else:
             # defer image feature computation on a frame until it's being tracked
             backbone_out = {"backbone_fpn": None, "vision_pos_enc": None}

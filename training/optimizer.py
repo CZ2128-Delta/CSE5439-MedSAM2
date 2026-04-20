@@ -31,6 +31,27 @@ from omegaconf import DictConfig
 from torch import Tensor
 
 
+# FSDP adds this prefix to ``named_parameters()`` / ``named_modules()`` for every
+# wrapped sub-module. With ``use_orig_params=True`` the underlying parameter tensors
+# are the same, but names are decorated, breaking pattern matching such as
+# ``image_encoder.*``. Stripping this prefix everywhere we read *names* makes the
+# optimizer construction logic transparent to FSDP wrapping (including nested wraps).
+_FSDP_WRAPPED_MODULE_PREFIX = "_fsdp_wrapped_module."
+
+
+def _strip_fsdp_prefix(name: str) -> str:
+    """Remove every occurrence of ``_fsdp_wrapped_module.`` from a parameter/module name."""
+    if _FSDP_WRAPPED_MODULE_PREFIX in name:
+        return name.replace(_FSDP_WRAPPED_MODULE_PREFIX, "")
+    return name
+
+
+def _named_parameters_unwrapped(model: nn.Module):
+    """Yield ``(name, param)`` pairs with any FSDP wrapper prefixes stripped from ``name``."""
+    for name, param in model.named_parameters():
+        yield _strip_fsdp_prefix(name), param
+
+
 class Optimizer:
     def __init__(self, optimizer, schedulers=None) -> None:
         self.optimizer = optimizer
@@ -287,6 +308,7 @@ def get_module_cls_to_param_names(
 
     module_cls_to_params = {}
     for module_name, module in model.named_modules():
+        module_name = _strip_fsdp_prefix(module_name)
         module_cls = type(module)
         module_cls_to_params.setdefault(module_cls, set())
         for param_name, _ in module.named_parameters(recurse=False):
@@ -326,11 +348,11 @@ def construct_optimizer(
             overlap and cover all the model parameters.
     """
     if param_allowlist is None:
-        param_allowlist = {name for name, _ in model.named_parameters()}
+        param_allowlist = {name for name, _ in _named_parameters_unwrapped(model)}
 
     named_parameters = {
         name: param
-        for name, param in model.named_parameters()
+        for name, param in _named_parameters_unwrapped(model)
         if name in param_allowlist
     }
 
@@ -339,7 +361,7 @@ def construct_optimizer(
         return Optimizer(optimizer)
 
     all_parameter_names = {
-        name for name, _ in model.named_parameters() if name in param_allowlist
+        name for name, _ in _named_parameters_unwrapped(model) if name in param_allowlist
     }
     module_cls_to_all_param_names = get_module_cls_to_param_names(
         model, param_allowlist

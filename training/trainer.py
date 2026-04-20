@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import gc
 import json
 import logging
@@ -63,6 +64,27 @@ def unwrap_ddp_if_wrapped(model):
     return model
 
 
+def _is_fsdp_module(model):
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as _FSDP
+    except ImportError:
+        return False
+    return isinstance(model, _FSDP)
+
+
+def unwrap_model_if_wrapped(model):
+    """Unwrap DDP or FSDP if applicable; returns the underlying module otherwise.
+
+    Note: calling ``state_dict()`` on the returned object does NOT gather sharded
+    parameters for FSDP; use the FSDP state_dict context for that.
+    """
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return model.module
+    if _is_fsdp_module(model):
+        return model.module
+    return model
+
+
 @dataclass
 class OptimAMPConf:
     enabled: bool = False
@@ -96,6 +118,36 @@ class DistributedConf:
 
 
 @dataclass
+class FSDPConf:
+    """Fully Sharded Data Parallel configuration.
+
+    When ``enabled`` is True, the Trainer uses ``torch.distributed.fsdp.FullyShardedDataParallel``
+    instead of DDP. Checkpoints are saved/loaded as full (unsharded) state dicts on rank 0,
+    so they remain interchangeable with DDP checkpoints.
+    """
+
+    enabled: bool = False
+    sharding_strategy: str = "FULL_SHARD"  # FULL_SHARD | SHARD_GRAD_OP | NO_SHARD | HYBRID_SHARD
+    backward_prefetch: Optional[str] = "BACKWARD_PRE"  # BACKWARD_PRE | BACKWARD_POST | null
+    mixed_precision: Optional[str] = None  # null | "fp16" | "bf16"
+    cpu_offload: bool = False
+    use_orig_params: bool = True  # keep original param names so param-group modifiers still work
+    limit_all_gathers: bool = True
+    forward_prefetch: bool = False
+    sync_module_states: bool = True
+    # Auto-wrap policy: if ``transformer_cls_names`` is non-empty it takes precedence over size-based wrap.
+    # Default targets SAM2's transformer blocks.
+    transformer_cls_names: List[str] = field(
+        default_factory=lambda: [
+            "sam2.modeling.backbones.hieradet.MultiScaleBlock",
+            "sam2.modeling.memory_attention.MemoryAttentionLayer",
+            "sam2.modeling.sam.transformer.TwoWayAttentionBlock",
+        ]
+    )
+    min_num_params: int = 0  # used only when transformer_cls_names is empty
+
+
+@dataclass
 class CudaConf:
     cudnn_deterministic: bool = False
     cudnn_benchmark: bool = True
@@ -123,6 +175,19 @@ class CheckpointConf:
             with_skip_saving = len(self.skip_saving_parameters) > 0
             self.initialize_after_preemption = with_skip_saving
         return self
+
+
+@dataclass
+class ActivationOffloadingConf:
+    """Offload saved activations to CPU during forward and bring them back for backward.
+
+    Wraps the training forward pass in ``torch.autograd.graph.save_on_cpu`` so that the
+    autograd-saved tensors live on CPU between forward and backward. Reduces GPU
+    memory at the cost of extra H2D/D2H traffic per step.
+    """
+
+    enabled: bool = False
+    pin_memory: bool = True  # faster CPU<->GPU copies; costs pinned host RAM
 
 
 @dataclass
@@ -169,6 +234,8 @@ class Trainer:
         optim_overrides: Optional[List[Dict[str, Any]]] = None,
         meters: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
+        activation_offloading: Optional[Dict[str, Any]] = None,
+        fsdp: Optional[Dict[str, Any]] = None,
     ):
 
         self._setup_env_variables(env_variables)
@@ -184,6 +251,10 @@ class Trainer:
         self.optim_conf = OptimConf(**optim) if optim is not None else None
         self.meters_conf = meters
         self.loss_conf = loss
+        self.activation_offloading_conf = ActivationOffloadingConf(
+            **(activation_offloading or {})
+        )
+        self.fsdp_conf = FSDPConf(**(fsdp or {}))
         distributed = DistributedConf(**distributed or {})
         cuda = CudaConf(**cuda or {})
         self.where = 0.0
@@ -210,28 +281,69 @@ class Trainer:
             is_dist_avail_and_initialized()
         ), "Torch distributed needs to be initialized before calling the trainer."
 
-        self._setup_components()  # Except Optimizer everything is setup here.
-        self._move_to_device()
-        self._construct_optimizers()
-        self._setup_dataloaders()
+        if self.fsdp_conf.enabled:
+            # FSDP path: wrap the model *before* the optimizer is constructed
+            # (FSDP replaces parameters with sharded versions). Note: do NOT call
+            # ``logging.info`` in __init__; the ``logging`` kwarg shadows the module
+            # here. ``_setup_fsdp_distributed_training`` already logs the setup.
+            self._setup_components()
+            self._setup_dataloaders()
+            self.time_elapsed_meter = DurationMeter(
+                "Time Elapsed", self.device, ":.2f"
+            )
 
-        self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.2f")
+            if self.checkpoint_conf.resume_from is not None:
+                assert os.path.exists(
+                    self.checkpoint_conf.resume_from
+                ), f"The 'resume_from' checkpoint {self.checkpoint_conf.resume_from} does not exist!"
+                dst = os.path.join(
+                    self.checkpoint_conf.save_dir, "checkpoint.pt"
+                )
+                if self.distributed_rank == 0 and not os.path.exists(dst):
+                    makedir(self.checkpoint_conf.save_dir)
+                    g_pathmgr.copy(self.checkpoint_conf.resume_from, dst)
+                barrier()
 
-        if self.checkpoint_conf.resume_from is not None:
-            assert os.path.exists(
-                self.checkpoint_conf.resume_from
-            ), f"The 'resume_from' checkpoint {self.checkpoint_conf.resume_from} does not exist!"
-            dst = os.path.join(self.checkpoint_conf.save_dir, "checkpoint.pt")
-            if self.distributed_rank == 0 and not os.path.exists(dst):
-                # Copy the "resume_from" checkpoint to the checkpoint folder
-                # if there is not a checkpoint to resume from already there
-                makedir(self.checkpoint_conf.save_dir)
-                g_pathmgr.copy(self.checkpoint_conf.resume_from, dst)
+            # Pretrained-weight init happens on the bare (CPU) model; resume
+            # from a sharded-unfriendly ckpt will be re-loaded after FSDP wrap.
+            resume_ckpt_path = get_resume_checkpoint(
+                self.checkpoint_conf.save_dir
+            )
+            if resume_ckpt_path is None:
+                self._init_model_state()
+            # Wrap with FSDP (moves the module to ``self.device`` and shards parameters).
+            self._setup_fsdp_distributed_training(accelerator)
+            # Optimizer must be constructed *after* FSDP wrap when use_orig_params=True
+            # (optimizer sees the flat/sharded parameters FSDP exposes).
+            self._construct_optimizers()
+            if resume_ckpt_path is not None:
+                self._load_resuming_checkpoint(resume_ckpt_path)
             barrier()
+        else:
+            self._setup_components()  # Except Optimizer everything is setup here.
+            self._move_to_device()
+            self._construct_optimizers()
+            self._setup_dataloaders()
 
-        self.load_checkpoint()
-        self._setup_ddp_distributed_training(distributed, accelerator)
-        barrier()
+            self.time_elapsed_meter = DurationMeter(
+                "Time Elapsed", self.device, ":.2f"
+            )
+
+            if self.checkpoint_conf.resume_from is not None:
+                assert os.path.exists(
+                    self.checkpoint_conf.resume_from
+                ), f"The 'resume_from' checkpoint {self.checkpoint_conf.resume_from} does not exist!"
+                dst = os.path.join(self.checkpoint_conf.save_dir, "checkpoint.pt")
+                if self.distributed_rank == 0 and not os.path.exists(dst):
+                    # Copy the "resume_from" checkpoint to the checkpoint folder
+                    # if there is not a checkpoint to resume from already there
+                    makedir(self.checkpoint_conf.save_dir)
+                    g_pathmgr.copy(self.checkpoint_conf.resume_from, dst)
+                barrier()
+
+            self.load_checkpoint()
+            self._setup_ddp_distributed_training(distributed, accelerator)
+            barrier()
 
     def _setup_timers(self):
         """
@@ -315,6 +427,129 @@ class Trainer:
             process_group = None
             self.model.register_comm_hook(process_group, hook)
 
+    def _setup_fsdp_distributed_training(self, accelerator):
+        """Wrap ``self.model`` with FullyShardedDataParallel according to ``self.fsdp_conf``.
+
+        Runs entirely in-place; after this call ``self.model`` is an FSDP instance
+        on ``self.device``. Optimizer must be constructed after this step.
+        """
+        assert (
+            accelerator == "cuda"
+        ), "FSDP is only supported with the cuda accelerator."
+
+        from torch.distributed.fsdp import (
+            BackwardPrefetch,
+            CPUOffload,
+            FullyShardedDataParallel as FSDP,
+            MixedPrecision,
+            ShardingStrategy,
+        )
+
+        sharding_map = {
+            "FULL_SHARD": ShardingStrategy.FULL_SHARD,
+            "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
+            "NO_SHARD": ShardingStrategy.NO_SHARD,
+            "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
+        }
+        sharding_strategy = sharding_map[self.fsdp_conf.sharding_strategy]
+
+        backward_prefetch = None
+        if self.fsdp_conf.backward_prefetch:
+            bp_map = {
+                "BACKWARD_PRE": BackwardPrefetch.BACKWARD_PRE,
+                "BACKWARD_POST": BackwardPrefetch.BACKWARD_POST,
+            }
+            backward_prefetch = bp_map[self.fsdp_conf.backward_prefetch]
+
+        mp_policy = None
+        if self.fsdp_conf.mixed_precision:
+            mp_dtype = get_amp_type(self.fsdp_conf.mixed_precision)
+            mp_policy = MixedPrecision(
+                param_dtype=mp_dtype,
+                reduce_dtype=mp_dtype,
+                buffer_dtype=mp_dtype,
+            )
+
+        auto_wrap_policy = self._build_fsdp_auto_wrap_policy()
+
+        self.model = FSDP(
+            self.model,
+            sharding_strategy=sharding_strategy,
+            backward_prefetch=backward_prefetch,
+            mixed_precision=mp_policy,
+            cpu_offload=CPUOffload(offload_params=self.fsdp_conf.cpu_offload)
+            if self.fsdp_conf.cpu_offload
+            else None,
+            auto_wrap_policy=auto_wrap_policy,
+            use_orig_params=self.fsdp_conf.use_orig_params,
+            limit_all_gathers=self.fsdp_conf.limit_all_gathers,
+            forward_prefetch=self.fsdp_conf.forward_prefetch,
+            sync_module_states=self.fsdp_conf.sync_module_states,
+            device_id=self.local_rank,
+        )
+
+        logging.info(
+            "Wrapped model with FSDP (sharding_strategy=%s, mixed_precision=%s, "
+            "cpu_offload=%s, use_orig_params=%s).",
+            self.fsdp_conf.sharding_strategy,
+            self.fsdp_conf.mixed_precision,
+            self.fsdp_conf.cpu_offload,
+            self.fsdp_conf.use_orig_params,
+        )
+
+    def _build_fsdp_auto_wrap_policy(self):
+        """Build the FSDP auto wrap policy from config.
+
+        Prefer class-based wrapping on transformer blocks (``transformer_cls_names``);
+        fall back to size-based wrapping when ``min_num_params > 0``; otherwise no auto
+        wrap policy (FSDP only wraps the outer module).
+        """
+        import importlib
+
+        from torch.distributed.fsdp.wrap import (
+            ModuleWrapPolicy,
+            size_based_auto_wrap_policy,
+        )
+
+        cls_names = list(self.fsdp_conf.transformer_cls_names or [])
+        transformer_classes = set()
+        for dotted in cls_names:
+            module_name, _, class_name = dotted.rpartition(".")
+            if not module_name:
+                logging.warning(
+                    "Skipping FSDP wrap class %r (missing module path).", dotted
+                )
+                continue
+            try:
+                module = importlib.import_module(module_name)
+                transformer_classes.add(getattr(module, class_name))
+            except (ImportError, AttributeError) as e:
+                logging.warning(
+                    "Skipping FSDP wrap class %r (%s).", dotted, e
+                )
+
+        if transformer_classes:
+            logging.info(
+                "FSDP auto-wrap policy: module-based on %d transformer class(es).",
+                len(transformer_classes),
+            )
+            return ModuleWrapPolicy(transformer_classes)
+
+        if self.fsdp_conf.min_num_params and self.fsdp_conf.min_num_params > 0:
+            logging.info(
+                "FSDP auto-wrap policy: size-based (min_num_params=%d).",
+                self.fsdp_conf.min_num_params,
+            )
+            from functools import partial
+
+            return partial(
+                size_based_auto_wrap_policy,
+                min_num_params=self.fsdp_conf.min_num_params,
+            )
+
+        logging.info("FSDP auto-wrap policy: none (outer module only).")
+        return None
+
     def _move_to_device(self):
         logging.info(
             f"Moving components to device {self.device} and local rank {self.local_rank}."
@@ -341,14 +576,19 @@ class Trainer:
         for ckpt_name in checkpoint_names:
             checkpoint_paths.append(os.path.join(checkpoint_folder, f"{ckpt_name}.pt"))
 
-        state_dict = unwrap_ddp_if_wrapped(self.model).state_dict()
+        if _is_fsdp_module(self.model):
+            state_dict, optim_state = self._fsdp_full_state_dicts()
+        else:
+            state_dict = unwrap_ddp_if_wrapped(self.model).state_dict()
+            optim_state = self.optim.optimizer.state_dict()
+
         state_dict = exclude_params_matching_unix_pattern(
             patterns=self.checkpoint_conf.skip_saving_parameters, state_dict=state_dict
         )
 
         checkpoint = {
             "model": state_dict,
-            "optimizer": self.optim.optimizer.state_dict(),
+            "optimizer": optim_state,
             "epoch": epoch,
             "loss": self.loss.state_dict(),
             "steps": self.steps,
@@ -358,12 +598,33 @@ class Trainer:
         if self.optim_conf.amp.enabled:
             checkpoint["scaler"] = self.scaler.state_dict()
 
-        # DDP checkpoints are only saved on rank 0 (all workers are identical)
+        # DDP/FSDP checkpoints are only saved on rank 0 (full state is gathered there).
         if self.distributed_rank != 0:
             return
 
         for checkpoint_path in checkpoint_paths:
             self._save_checkpoint(checkpoint, checkpoint_path)
+
+    def _fsdp_full_state_dicts(self):
+        """Gather the FSDP model and optimizer state to rank 0 as full (unsharded) dicts."""
+        from torch.distributed.fsdp import (
+            FullOptimStateDictConfig,
+            FullStateDictConfig,
+            FullyShardedDataParallel as FSDP,
+            StateDictType,
+        )
+
+        model_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        optim_cfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(
+            self.model,
+            StateDictType.FULL_STATE_DICT,
+            state_dict_config=model_cfg,
+            optim_state_dict_config=optim_cfg,
+        ):
+            model_sd = self.model.state_dict()
+            optim_sd = FSDP.optim_state_dict(self.model, self.optim.optimizer)
+        return model_sd, optim_sd
 
     def _save_checkpoint(self, checkpoint, checkpoint_path):
         """
@@ -429,13 +690,17 @@ class Trainer:
 
         with g_pathmgr.open(ckpt_path, "rb") as f:
             checkpoint = torch.load(f, map_location="cpu")
-        load_state_dict_into_model(
-            model=self.model,
-            state_dict=checkpoint["model"],
-            ignore_missing_keys=self.checkpoint_conf.skip_saving_parameters,
-        )
 
-        self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
+        if _is_fsdp_module(self.model):
+            self._load_resuming_checkpoint_fsdp(checkpoint)
+        else:
+            load_state_dict_into_model(
+                model=self.model,
+                state_dict=checkpoint["model"],
+                ignore_missing_keys=self.checkpoint_conf.skip_saving_parameters,
+            )
+            self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
+
         self.loss.load_state_dict(checkpoint["loss"], strict=True)
         self.epoch = checkpoint["epoch"]
         self.steps = checkpoint["steps"]
@@ -448,6 +713,37 @@ class Trainer:
 
         if "train_dataset" in checkpoint and self.train_dataset is not None:
             self.train_dataset.load_checkpoint_state(checkpoint["train_dataset"])
+
+    def _load_resuming_checkpoint_fsdp(self, checkpoint: Dict[str, Any]):
+        """Load a full (unsharded) checkpoint into the FSDP-wrapped model and optimizer."""
+        from torch.distributed.fsdp import (
+            FullOptimStateDictConfig,
+            FullStateDictConfig,
+            FullyShardedDataParallel as FSDP,
+            StateDictType,
+        )
+
+        model_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        optim_cfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        with FSDP.state_dict_type(
+            self.model,
+            StateDictType.FULL_STATE_DICT,
+            state_dict_config=model_cfg,
+            optim_state_dict_config=optim_cfg,
+        ):
+            missing = self.model.load_state_dict(checkpoint["model"], strict=False)
+            if missing.missing_keys or missing.unexpected_keys:
+                logging.warning(
+                    "FSDP resume: missing=%s unexpected=%s",
+                    missing.missing_keys,
+                    missing.unexpected_keys,
+                )
+            optim_sd = FSDP.optim_state_dict_to_load(
+                model=self.model,
+                optim=self.optim.optimizer,
+                optim_state_dict=checkpoint["optimizer"],
+            )
+            self.optim.optimizer.load_state_dict(optim_sd)
 
     def is_intermediate_val_epoch(self, epoch):
         return epoch % self.val_epoch_freq == 0 and epoch < self.max_epochs - 1
@@ -607,8 +903,8 @@ class Trainer:
 
         for model in curr_models:
             model.eval()
-            if hasattr(unwrap_ddp_if_wrapped(model), "on_validation_epoch_start"):
-                unwrap_ddp_if_wrapped(model).on_validation_epoch_start()
+            if hasattr(unwrap_model_if_wrapped(model), "on_validation_epoch_start"):
+                unwrap_model_if_wrapped(model).on_validation_epoch_start()
 
         progress = ProgressMeter(
             iters_per_epoch,
@@ -682,8 +978,8 @@ class Trainer:
         self.est_epoch_time[phase] = batch_time.avg * iters_per_epoch
         self._log_timers(phase)
         for model in curr_models:
-            if hasattr(unwrap_ddp_if_wrapped(model), "on_validation_epoch_end"):
-                unwrap_ddp_if_wrapped(model).on_validation_epoch_end()
+            if hasattr(unwrap_model_if_wrapped(model), "on_validation_epoch_end"):
+                unwrap_model_if_wrapped(model).on_validation_epoch_end()
 
         out_dict = self._log_meters_and_save_best_ckpts(curr_phases)
 
@@ -789,7 +1085,16 @@ class Trainer:
                 # Clipping gradients and detecting diverging gradients
                 if self.gradient_clipper is not None:
                     self.scaler.unscale_(self.optim.optimizer)
-                    self.gradient_clipper(model=self.model)
+                    if _is_fsdp_module(self.model) and getattr(
+                        self.gradient_clipper, "max_norm", None
+                    ) is not None:
+                        # FSDP.clip_grad_norm_ correctly handles sharded gradients.
+                        self.model.clip_grad_norm_(
+                            max_norm=self.gradient_clipper.max_norm,
+                            norm_type=self.gradient_clipper.norm_type,
+                        )
+                    else:
+                        self.gradient_clipper(model=self.model)
 
                 if self.gradient_logger is not None:
                     self.gradient_logger(
@@ -868,7 +1173,14 @@ class Trainer:
         # grads will also update a model even if the step doesn't produce
         # gradients
         self.optim.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(
+        offload_cm = (
+            torch.autograd.graph.save_on_cpu(
+                pin_memory=self.activation_offloading_conf.pin_memory
+            )
+            if self.activation_offloading_conf.enabled
+            else contextlib.nullcontext()
+        )
+        with offload_cm, torch.cuda.amp.autocast(
             enabled=self.optim_conf.amp.enabled,
             dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
         ):

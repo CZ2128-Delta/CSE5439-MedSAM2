@@ -107,6 +107,7 @@ class MemoryAttention(nn.Module):
         layer: nn.Module,
         num_layers: int,
         batch_first: bool = True,  # Do layers expect batch first input?
+        grad_ckpt: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -115,6 +116,7 @@ class MemoryAttention(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.pos_enc_at_input = pos_enc_at_input
         self.batch_first = batch_first
+        self.grad_ckpt = grad_ckpt
 
     def forward(
         self,
@@ -152,13 +154,24 @@ class MemoryAttention(nn.Module):
             if isinstance(layer.cross_attn_image, RoPEAttention):
                 kwds = {"num_k_exclude_rope": num_obj_ptr_tokens}
 
-            output = layer(
-                tgt=output,
-                memory=memory,
-                pos=memory_pos,
-                query_pos=curr_pos,
-                **kwds,
-            )
+            if self.grad_ckpt and self.training:
+                output = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    output,
+                    memory,
+                    memory_pos,
+                    curr_pos,
+                    kwds.get("num_k_exclude_rope", 0),
+                    use_reentrant=False,
+                )
+            else:
+                output = layer(
+                    tgt=output,
+                    memory=memory,
+                    pos=memory_pos,
+                    query_pos=curr_pos,
+                    **kwds,
+                )
         normed_output = self.norm(output)
 
         if self.batch_first:

@@ -315,7 +315,7 @@ trainer:
   # Checkpoints are saved/loaded as full (unsharded) state dicts on rank 0, so
   # they remain interchangeable with DDP checkpoints.
   fsdp:
-    enabled: False
+    enabled: True
     # FULL_SHARD (max memory savings) | SHARD_GRAD_OP | NO_SHARD | HYBRID_SHARD
     sharding_strategy: FULL_SHARD
     # BACKWARD_PRE (recommended) | BACKWARD_POST | null

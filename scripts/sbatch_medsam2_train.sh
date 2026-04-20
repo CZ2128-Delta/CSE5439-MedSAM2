@@ -2,7 +2,7 @@
 #SBATCH --account=pas3272
 #SBATCH --partition=quad
 #SBATCH --job-name=medsam2_train
-#SBATCH --time=12:00:00
+#SBATCH --time=4:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=2
@@ -44,14 +44,18 @@ echo "Number of nodes: ${NUM_NODES}"
 echo "GPUs per node: ${NUM_GPUS}"
 
 # Default training config and log dir
-CONFIG="configs/sam2.1_hiera_tiny512_FLARE_RECIST.yaml"
-OUTPUT_PATH="/fs/scratch/PAS3272/liu12122/MedImgSeg/outputs/sam2.1_hiera_tiny512_FLARE_RECIST"
+CONFIG="configs/exp/sam2.1_hiera_tiny512_FLARE_RECIST_FSDP.yaml"
+OUTPUT_PATH="/fs/scratch/PAS3272/liu12122/MedImgSeg/outputs/FSDP_2GPU"
 
 # Weights & Biases: set project (required to enable W&B). Name is optional.
 # Authenticate with `export WANDB_API_KEY=...` or `wandb login` before submitting.
 WANDB_PROJECT="MedSAM2"
-WANDB_NAME="baseline_2GPU"
+WANDB_NAME="FSDP_2GPU"
 WANDB_ENTITY=""
+
+# W&B default init timeout is 90s; slow or flaky links to api.wandb.ai can fail there.
+# Override with WANDB_INIT_TIMEOUT=600 if needed.
+export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 
 WANDB_ARGS=()
 if [[ -n "${WANDB_PROJECT}" ]]; then

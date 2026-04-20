@@ -3,7 +3,7 @@
 scratch:
   resolution: 512
   train_video_batch_size: 8 # increase batch size based on your computing
-  num_train_workers: 8
+  num_train_workers: 4
   num_frames: 8
   max_num_objects: 3
   base_lr: 5.0e-5

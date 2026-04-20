@@ -60,12 +60,6 @@ trainer:
   accelerator: cuda
   seed_value: 123
 
-  # Activation offloading: move autograd-saved tensors to CPU between forward and backward.
-  # Trades GPU memory for extra H2D/D2H traffic. Leave disabled for baseline runs.
-  activation_offloading:
-    enabled: False
-    pin_memory: True
-
   model:
     _target_: training.model.sam2.SAM2Train
     image_encoder:
@@ -203,7 +197,7 @@ trainer:
     # Deep gradient checkpointing: trades compute for memory by not storing
     # intermediate activations in the backbone, memory attention, and memory encoder.
     # Reduces peak GPU memory ~30-50% at the cost of ~20-30% slower training.
-    grad_ckpt: false
+    grad_ckpt: true
     # Chunked backbone forward: split the B*T image batch into chunks of this
     # size when running the image encoder.  Lowers peak GPU memory at the cost
     # of slightly slower throughput.  Set to 0 to disable (default: process all
@@ -310,33 +304,6 @@ trainer:
   distributed:
     backend: nccl #  gloo or nccl
     find_unused_parameters: True
-
-  # Fully Sharded Data Parallel (FSDP). When ``enabled: True`` this replaces DDP.
-  # Checkpoints are saved/loaded as full (unsharded) state dicts on rank 0, so
-  # they remain interchangeable with DDP checkpoints.
-  fsdp:
-    enabled: False
-    # FULL_SHARD (max memory savings) | SHARD_GRAD_OP | NO_SHARD | HYBRID_SHARD
-    sharding_strategy: FULL_SHARD
-    # BACKWARD_PRE (recommended) | BACKWARD_POST | null
-    backward_prefetch: BACKWARD_PRE
-    # null (disable) | fp16 | bf16. Mutually-redundant with ``optim.amp``; prefer ONE of them.
-    mixed_precision: null
-    # Offload sharded parameters to CPU. Further reduces GPU memory at cost of step time.
-    cpu_offload: False
-    # Required for param-group modifiers (per-module LR such as ``image_encoder.*``) to keep working.
-    use_orig_params: True
-    limit_all_gathers: True
-    forward_prefetch: False
-    # Broadcast module states from rank 0 at wrap time to keep all ranks in sync.
-    sync_module_states: True
-    # Auto-wrap SAM2's transformer blocks (module-class policy is preferred for accuracy).
-    transformer_cls_names:
-      - sam2.modeling.backbones.hieradet.MultiScaleBlock
-      - sam2.modeling.memory_attention.MemoryAttentionLayer
-      - sam2.modeling.sam.transformer.TwoWayAttentionBlock
-    # Fallback size-based policy when ``transformer_cls_names`` is empty. 0 disables.
-    min_num_params: 0
 
   logging:
     tensorboard_writer:
