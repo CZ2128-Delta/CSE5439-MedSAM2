@@ -1,3 +1,13 @@
+# CSE5439 Course Project
+
+Baseline: MedSAM2
+
+Implemented four memory optimization techniques:
+- Gradient Checkpointing
+- Chunked Backbone Forward
+- Activation Offloading
+- Replace DDP with FSDP
+
 # MedSAM2
 <div align="center">
 
